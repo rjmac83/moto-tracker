@@ -33,7 +33,7 @@
     <application
         android:name=".TrackerApp"
         android:allowBackup="false"
-        android:label="Moto Tracker"
+        android:label="Tether"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:networkSecurityConfig="@xml/network_security_config"
@@ -43,7 +43,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="Moto Tracker">
+            android:label="Tether">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -72,6 +72,11 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Listening for the other rider starting a ride, and for a crash alert about them" />
         </service>
+
+        <!-- Woken by the OS when the phone leaves home (Home): opens a trip. -->
+        <receiver
+            android:name=".HomeReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".BootReceiver"

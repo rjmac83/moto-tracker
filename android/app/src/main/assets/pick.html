@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<link rel="stylesheet" href="leaflet.css">
+<style>
+  html,body,#map{height:100%;margin:0;background:#e9e6df}
+  .leaflet-container{font:13px Roboto,sans-serif;-webkit-touch-callout:none;-webkit-user-select:none}
+  .leaflet-control-attribution{background:rgba(255,255,255,.75);color:#555;font-size:9px}
+  .me{width:16px;height:16px;border-radius:50%;background:#1a6fd6;border:2px solid #fff;
+    box-shadow:0 0 0 4px rgba(26,111,214,.3),0 0 0 5px rgba(0,0,0,.35)}
+  /* The pin: a teardrop with its point on the spot. */
+  .pin{width:30px;height:30px;background:#ff4d4f;border:3px solid #fff;
+    border-radius:50% 50% 50% 0;transform:rotate(-45deg);box-shadow:0 2px 6px rgba(0,0,0,.5)}
+  .pin::after{content:"";position:absolute;left:8px;top:8px;width:8px;height:8px;
+    border-radius:50%;background:#fff}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="leaflet.js"></script>
+<script>
+/*
+ * Choosing where home is (Jack, 2026-10-12). Opens on the phone's position, zoomed out
+ * to take in 100 km each way; pinch and drag to find the house, long press to drop a
+ * pin. The app is told through the Tether bridge, and shows the button itself.
+ */
+var picker = (function () {
+  var map, pin;
+  function start(key, heightPx, lat, lon) {
+    if (window.__ready) return 'already started';
+    if (typeof L === 'undefined') return 'leaflet did not load';
+    try {
+      if (heightPx > 0) {
+        var px = heightPx + 'px';
+        document.documentElement.style.height = px;
+        document.body.style.height = px;
+        document.getElementById('map').style.height = px;
+      }
+      map = L.map('map', { zoomControl: false, attributionControl: true, minZoom: 3, maxZoom: 19 });
+      map.attributionControl.setPrefix('').addAttribution('TomTom');
+      L.tileLayer('https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=' + key,
+                  { maxZoom: 19, minZoom: 3 }).addTo(map);
+      L.marker([lat, lon], { interactive: false, keyboard: false,
+        icon: L.divIcon({ className: '', html: '<div class="me"></div>',
+                          iconSize: [16, 16], iconAnchor: [8, 8] }) }).addTo(map);
+      // 200 km square round the phone: 100 km each way.
+      map.fitBounds(L.latLng(lat, lon).toBounds(200000));
+      map.on('contextmenu', function (e) { drop(e.latlng); });
+      setTimeout(function () { map.invalidateSize(); }, 60);
+      window.__ready = true;
+    } catch (e) { return 'failed: ' + (e && e.message || e); }
+    return 'ok';
+  }
+  function drop(ll) {
+    if (pin) pin.setLatLng(ll);
+    else pin = L.marker(ll, { interactive: false, keyboard: false,
+      icon: L.divIcon({ className: '', html: '<div class="pin"></div>',
+                        iconSize: [30, 30], iconAnchor: [4, 30] }) }).addTo(map);
+    if (window.Tether) window.Tether.pinned(ll.lat, ll.lng);
+  }
+  return { start: start };
+})();
+</script>
+</body>
+</html>

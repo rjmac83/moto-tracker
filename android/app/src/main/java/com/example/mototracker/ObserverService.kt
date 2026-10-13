@@ -91,7 +91,7 @@ class ObserverService : Service() {
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         return Notification.Builder(this, CHANNEL)
-            .setContentTitle("Moto Tracker")
+            .setContentTitle("Tether")
             .setContentText("Listening for rides")
             .setSmallIcon(R.drawable.ic_stat_watch)
             .setContentIntent(open)

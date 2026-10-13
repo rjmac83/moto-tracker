@@ -160,7 +160,7 @@ fun RiderMap(
             .put("lat", lat).put("lon", lon)
             .put("speed", speedKmh)
             .put("moving", speedKmh >= 3)
-            .put("stopped", stoppedLabel ?: "stopped")
+            .put("stopped", stoppedLabel ?: "Stopped")
             .put("alarm", alarm)
             .put("lost", signalLostFor != null)
             .put("lostFor", signalLostFor ?: "")
@@ -192,8 +192,12 @@ private fun unquote(answer: String?): String =
     runCatching { JSONTokener(answer ?: "").nextValue() as? String }.getOrNull() ?: (answer ?: "")
 
 @SuppressLint("SetJavaScriptEnabled")
-internal fun makeWebView(ctx: Context, report: (String) -> Unit = {}, onReady: () -> Unit): WebView =
+internal fun makeWebView(
+    ctx: Context, report: (String) -> Unit = {}, page: String = "map.html",
+    bridge: Any? = null, onReady: () -> Unit,
+): WebView =
     WebView(ctx).apply {
+        if (bridge != null) addJavascriptInterface(bridge, "Tether")
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         // Tiles are cacheable for a long time; using the cache is what keeps the
@@ -219,5 +223,62 @@ internal fun makeWebView(ctx: Context, report: (String) -> Unit = {}, onReady: (
                 if (req.isForMainFrame) report("page failed: ${err.description}")
             }
         }
-        loadUrl("file:///android_asset/map.html")
+        loadUrl("file:///android_asset/$page")
     }
+
+/**
+ * The home picker's map (Jack, 2026-10-12): TomTom's day tiles, opening on [lat],[lon]
+ * with 100 km in every direction in view. A long press drops a pin and calls [onPin].
+ */
+@Composable
+fun HomePickerMap(lat: Double, lon: Double, height: Dp, onPin: (Double, Double) -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var web by remember { mutableStateOf<WebView?>(null) }
+    var ready by remember { mutableStateOf(false) }
+    var key by remember { mutableStateOf<String?>(null) }
+    var note by remember { mutableStateOf<String?>("Loading the map…") }
+    var started by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        var wait = 3_000L
+        while (key == null) {
+            key = withContext(Dispatchers.IO) { Relay.mapKey(context) }
+            if (key == null) {
+                note = "No map key from the relay yet"
+                delay(wait)
+                wait = (wait * 2).coerceAtMost(30_000L)
+            }
+        }
+    }
+    LaunchedEffect(ready, key, web) {
+        val view = web ?: return@LaunchedEffect
+        val k = key ?: return@LaunchedEffect
+        if (!ready || started) return@LaunchedEffect
+        view.evaluateJavascript(
+            "picker.start(${JSONObject.quote(k)}, ${height.value.toInt()}, $lat, $lon);") { answer ->
+            val said = unquote(answer)
+            RideLog.write(context, "HOME", "map picker: $said")
+            if (said == "ok" || said == "already started") { started = true; note = null }
+            else note = "The map could not start"
+        }
+    }
+    DisposableEffect(Unit) { onDispose { web?.destroy() } }
+
+    Box(Modifier.fillMaxWidth().height(height).clip(RoundedCornerShape(14.dp))) {
+        AndroidView(
+            factory = { ctx ->
+                val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                val bridge = object {
+                    @android.webkit.JavascriptInterface
+                    fun pinned(la: Double, lo: Double) { handler.post { onPin(la, lo) } }
+                }
+                makeWebView(ctx, report = { RideLog.write(ctx, "HOME", "map: $it") },
+                    page = "pick.html", bridge = bridge) { ready = true }.also { web = it }
+            },
+            modifier = Modifier.fillMaxWidth().height(height))
+        note?.let {
+            Text(it, color = Color(0xFF6B7480), fontSize = 13.sp, textAlign = TextAlign.Center,
+                modifier = Modifier.align(Alignment.Center).padding(24.dp))
+        }
+    }
+}

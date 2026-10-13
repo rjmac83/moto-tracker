@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.mototracker"
         minSdk = 31
         targetSdk = 37
-        versionCode = 114
-        versionName = "1.0.14"
+        versionCode = 115
+        versionName = "1.0"
         // On-device tests, for what only a real Android can show: ./gradlew connectedDebugAndroidTest
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

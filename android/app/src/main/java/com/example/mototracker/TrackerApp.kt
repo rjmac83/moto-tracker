@@ -26,5 +26,7 @@ class TrackerApp : Application() {
         RideLog.write(this, "APP", "process start build=${BuildConfig.VERSION_NAME}")
         DeviceKey.load(this)
         RideLog.write(this, "PAIR", if (DeviceKey.current != null) "device key present" else "not paired")
+        // The OS forgets geofences at a reboot and on a Play services update.
+        Home.register(this)
     }
 }

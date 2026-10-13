@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Tether: two riders, one line between them. The green dot is the rider on the road,
+     the blue one is whoever is watching, and the line is the tether. 108 x 108, with
+     everything inside the 66 x 66 centre the launcher never crops. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+
+    <!-- the line, gently bowed -->
+    <path
+        android:pathData="M37,68 C37,47 71,63 71,41"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient android:type="linear"
+                android:startX="37" android:startY="68" android:endX="71" android:endY="41">
+                <item android:offset="0" android:color="#FF3DDC84" />
+                <item android:offset="1" android:color="#FF4DA3FF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- halos -->
+    <path android:pathData="M37,68 m-14,0 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0"
+        android:fillColor="#333DDC84" />
+    <path android:pathData="M71,41 m-14,0 a14,14 0 1,0 28,0 a14,14 0 1,0 -28,0"
+        android:fillColor="#334DA3FF" />
+
+    <!-- the two riders -->
+    <path android:pathData="M37,68 m-8.5,0 a8.5,8.5 0 1,0 17,0 a8.5,8.5 0 1,0 -17,0"
+        android:fillColor="#FF3DDC84" />
+    <path android:pathData="M71,41 m-8.5,0 a8.5,8.5 0 1,0 17,0 a8.5,8.5 0 1,0 -17,0"
+        android:fillColor="#FF4DA3FF" />
+</vector>

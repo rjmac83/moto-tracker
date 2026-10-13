@@ -183,7 +183,7 @@ object OverlayPrompt {
             setPadding(52, 48, 52, 48)
         }
         root.addView(TextView(ctx).apply {
-            text = "MOTO TRACKER"
+            text = "TETHER"
             textSize = 12f
             letterSpacing = 0.18f
             setTextColor(Color.parseColor("#ff4d4f"))

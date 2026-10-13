@@ -112,9 +112,9 @@ object IncidentWatch {
             when {
                 key.startsWith("mine:") -> {
                     notify(ctx, "Rider incident open",
-                        "Moto Tracker detected a potential incident.", urgent = true)
+                        "Tether detected a potential incident.", urgent = true)
                     OverlayPrompt.incident(ctx, key, "Rider incident open",
-                        "Moto Tracker detected a potential incident.")
+                        "Tether detected a potential incident.")
                 }
                 key.startsWith("pending:") -> notify(ctx, headline, "No alarm yet", urgent = false)
                 key.endsWith(":silenced") -> {
@@ -123,9 +123,9 @@ object IncidentWatch {
                     notify(ctx, headline, "Alarm silenced — the incident is still open", urgent = true)
                 }
                 else -> {
-                    notify(ctx, headline, "Open Moto Tracker to silence and answer", urgent = true)
+                    notify(ctx, headline, "Open Tether to silence and answer", urgent = true)
                     OverlayPrompt.incident(ctx, key, "$name may have crashed",
-                        "Moto Tracker raised an alarm for $name.")
+                        "Tether raised an alarm for $name.")
                 }
             }
         }

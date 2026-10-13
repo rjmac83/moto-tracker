@@ -23,6 +23,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate as rotateDraw
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,14 +36,23 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.Dispatchers
@@ -60,11 +75,20 @@ private val ALARM = Color(0xFFA1121F)
 /** A signal loss: true yellow, apart from the amber of "stopped", as on the Macs. */
 private val SIG = Color(0xFFFFD60A)
 
+/**
+ * Everything was too small to read at a glance (Jack, 2026-10-12). One number scales
+ * every piece of text in the app, on top of whatever size the phone itself is set to.
+ */
+private const val FONT_BOOST = 1.3f
+
 /** The collapsed drawer: tall enough to hit with a gloved thumb. */
 private val DRAWER_BAR = 52.dp
 
+/** The tallest the rider / parked-bike picture grows. */
+private val SCENE_MAX = 190.dp
+
 /**
- * Moto Tracker.
+ * Tether (formerly Moto Tracker).
  *
  * One app, and the relay decides which face it shows: home when nobody has a trip
  * open, the rider's own trip, the other rider's Observer screen, or Hybrid when both
@@ -77,12 +101,17 @@ class MainActivity : ComponentActivity() {
     private var resumeCount by mutableIntStateOf(0)
 
     /**
-     * The diagnostics panel holds two buttons that raise real incidents. Left open,
-     * a screen left on in a pocket pressed one five times in ten seconds
-     * (2026-09-18). So it never outlives the screen: it closes whenever the app
-     * leaves the foreground, and whenever a trip starts or changes state.
+     * Settings never outlives the screen: it closes whenever the app leaves the
+     * foreground, so a phone pulled out of a pocket opens on the real screen
+     * (2026-09-18, when a pocket pressed buttons in the old diagnostics panel).
      */
-    private var showDiagnostics by mutableStateOf(false)
+    private var showSettings by mutableStateOf(false)
+
+    /** The map for choosing home, over Settings. */
+    private var pickingHome by mutableStateOf(false)
+
+    /** Set while the home location is waiting on the "allow all the time" answer. */
+    private var homeWatchAsked = false
 
     override fun onResume() {
         super.onResume()
@@ -91,7 +120,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        showDiagnostics = false
+        showSettings = false
+        pickingHome = false
     }
 
     private val permissions = registerForActivityResult(
@@ -102,10 +132,40 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    /**
+     * Watching for the phone leaving home with the app closed needs location "all the
+     * time", which Android only grants from a separate prompt after the first one.
+     */
+    private val backgroundLocation = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        RideLog.write(this, "PERM", "background location=$it")
+        Home.register(this)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         askForWhatWeNeed()
-        setContent { MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = PANEL)) { App() } }
+        setContent { Themed { App() } }
+    }
+
+    @Composable
+    private fun Themed(content: @Composable () -> Unit) {
+        val density = LocalDensity.current
+        CompositionLocalProvider(
+            LocalDensity provides Density(density.density, density.fontScale * FONT_BOOST)
+        ) {
+            MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = PANEL), content = content)
+        }
+    }
+
+    private fun hasBackgroundLocation() = ContextCompat.checkSelfPermission(
+        this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    private fun askForBackgroundLocation() {
+        if (hasBackgroundLocation() || homeWatchAsked) return
+        homeWatchAsked = true
+        backgroundLocation.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
     }
 
     private fun askForWhatWeNeed() {
@@ -149,27 +209,31 @@ class MainActivity : ComponentActivity() {
         var status by remember { mutableStateOf("") }
         var weather by remember { mutableStateOf(Weather.current()) }
         var tick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+        var logFailed by remember { mutableStateOf(Uploader.logWaiting(ctx)) }
+        var helpAsk by remember { mutableStateOf(false) }
 
         LaunchedEffect(resumeCount) {
             paired = DeviceKey.current != null
             tripState = Trip.state(ctx)
-        }
-        LaunchedEffect(tripState) {
-            if (tripState != Trip.State.IDLE) showDiagnostics = false
         }
         // The screen polls fast while it IS the screen; the listener service does the
         // slow listening behind it (Jack, 2026-09-27). Coming back to the foreground
         // asks the relay straight away — is anyone riding? — and the answer decides
         // whether this is the home screen or Observer mode.
         LaunchedEffect(Unit) {
+            var lastLogTry = 0L
             lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 while (true) {
                     if (DeviceKey.current != null) {
                         snap = withContext(Dispatchers.IO) { Relay.refresh(ctx) } ?: snap
-                        // A log that could not be sent when the trip ended goes now.
-                        if (snap != null && Uploader.logWaiting(ctx)) {
+                        // A log that could not be sent when the trip ended goes now, and
+                        // then once a minute; the home screen says so while it waits.
+                        if (snap != null && Uploader.logWaiting(ctx) &&
+                            System.currentTimeMillis() - lastLogTry > 60_000L) {
+                            lastLogTry = System.currentTimeMillis()
                             withContext(Dispatchers.IO) { runCatching { Uploader.uploadRideLog(ctx) } }
                         }
+                        logFailed = Uploader.logWaiting(ctx)
                         tripState = Trip.state(ctx)
                         val fresh = snap
                         val theirTrip = fresh?.other(ctx)?.takeIf { it.tripId != null }
@@ -210,14 +274,11 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        fun act(what: () -> Boolean, said: String) {
+        fun act(what: () -> Boolean, said: String, failed: String = "") {
             busy = true
             scope.launch {
                 val ok = withContext(Dispatchers.IO) { what() }
-                status = if (ok) said else "the relay did not answer — it will catch up"
-                // Decided here, after the action: ending a trip sends its log, and a
-                // log stranded by a dead spot is worth saying out loud.
-                if (Uploader.logWaiting(ctx)) status += " · log waiting for signal"
+                status = if (ok) said.replaceFirstChar { it.uppercase() } else failed
                 tripState = Trip.state(ctx)
                 snap = withContext(Dispatchers.IO) { Relay.refresh(ctx) } ?: snap
                 busy = false
@@ -225,12 +286,24 @@ class MainActivity : ComponentActivity() {
         }
 
         Surface(Modifier.fillMaxSize(), color = BG) {
-            Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
+            Column(Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = 18.dp)) {
                 Header(reach, snap)
                 val me = snap?.me(ctx)
                 val other = snap?.other(ctx)
                 val mine = me?.incident
                 val theirs = other?.incident
+
+                // On every screen, under the relay light. One press only asks; the
+                // dialog is what sends, so a pocket cannot raise a false alarm.
+                // The rider's own open incident has its own, final, I-need-help.
+                if (helpAsk) {
+                    HelpDialog(other?.name ?: if (Identity.get(ctx) == "jack") "Dana" else "Jack",
+                        onCancel = { helpAsk = false }) {
+                        helpAsk = false
+                        act({ Relay.needHelp(ctx) }, "Help requested — they have been alerted",
+                            "Help NOT sent — the relay did not answer. Call them.")
+                    }
+                }
 
                 // Like Waze: while anyone is out, the screen stays on for as long as
                 // this app is in front (Jack, 2026-09-27). The home screen with nobody
@@ -247,6 +320,12 @@ class MainActivity : ComponentActivity() {
                 // place their own buttons at the bottom of it.
                 Column(Modifier.weight(1f).fillMaxWidth()) {
                 when {
+                    showSettings && pickingHome -> HomePicker()
+
+                    showSettings -> SettingsScreen(paired, tripState,
+                        onPaired = { paired = DeviceKey.current != null },
+                        onLogSent = { logFailed = Uploader.logWaiting(ctx) })
+
                     !paired -> PairScreen { paired = DeviceKey.current != null }
 
                     // The other rider needs help. This is the only screen that shouts.
@@ -272,12 +351,11 @@ class MainActivity : ComponentActivity() {
                             ObserverScreen(other, theirs, weather, tick)
                         }
 
-                    else -> HomeScreen(snap, busy, ::act, status)
+                    else -> HomeScreen(snap, busy, ::act, status, logFailed)
                 }
                 }
 
-                Footer(showDiagnostics) { showDiagnostics = !showDiagnostics }
-                if (showDiagnostics) Diagnostics(paired) { paired = DeviceKey.current != null }
+                Footer(showSettings, onHelp = if (paired && mine == null) ({ helpAsk = true }) else null) { showSettings = !showSettings }
             }
         }
     }
@@ -291,7 +369,7 @@ class MainActivity : ComponentActivity() {
             Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("MOTO TRACKER", color = DIM, fontSize = 13.sp, letterSpacing = 2.sp)
+            Text("TETHER", color = DIM, fontSize = 13.sp, letterSpacing = 2.sp)
             Spacer(Modifier.weight(1f))
             Box(
                 Modifier.size(8.dp).clip(CircleShape)
@@ -299,12 +377,9 @@ class MainActivity : ComponentActivity() {
             )
             Spacer(Modifier.width(7.dp))
             Text(
-                if (reach != null) "relay ok" else "no relay",
+                if (reach != null) "Relay OK" else "No relay",
                 color = if (reach != null) DIM else BAD, fontSize = 12.sp
             )
-            snap?.me(ctx)?.battery?.let {
-                Text(" · $it%", color = DIM, fontSize = 12.sp)
-            }
         }
     }
 
@@ -324,10 +399,10 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun Card(content: @Composable ColumnScope.() -> Unit) {
+    private fun Card(modifier: Modifier = Modifier.fillMaxWidth(), pad: androidx.compose.ui.unit.Dp = 16.dp,
+                     content: @Composable ColumnScope.() -> Unit) {
         Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(PANEL)
-                .padding(16.dp),
+            modifier.clip(RoundedCornerShape(14.dp)).background(PANEL).padding(pad),
             content = content
         )
     }
@@ -389,15 +464,18 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun ColumnScope.HomeScreen(
         snap: Relay.Snapshot?, busy: Boolean,
-        act: (() -> Boolean, String) -> Unit, status: String,
+        act: (() -> Boolean, String) -> Unit, status: String, logFailed: Boolean,
     ) {
         val ctx = this@MainActivity
         val previous = remember(snap) { LastTrip.remember(ctx, snap?.me(ctx)?.previousTrip) }
         Column(Modifier.fillMaxWidth()) {
             Spacer(Modifier.height(10.dp))
-            Text(snap?.me(ctx)?.name ?: Identity.get(ctx).replaceFirstChar { it.uppercase() },
-                color = INK, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-            Text("not riding", color = FAINT, fontSize = 15.sp)
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text(snap?.me(ctx)?.name ?: Identity.get(ctx).replaceFirstChar { it.uppercase() },
+                    color = INK, fontSize = 30.sp, fontWeight = FontWeight.Bold)
+                Text("  Not riding", color = FAINT, fontSize = 15.sp,
+                    modifier = Modifier.padding(bottom = 5.dp))
+            }
             Spacer(Modifier.height(20.dp))
             if (previous != null) {
                 Card {
@@ -419,30 +497,26 @@ class MainActivity : ComponentActivity() {
         if (status.isNotEmpty()) {
             Text(status, color = DIM, fontSize = 13.sp, modifier = Modifier.padding(bottom = 8.dp))
         }
-        if (!Trip.autoResume(ctx)) {
-            Text("Auto-resume is off — the ride will not start by itself, and nothing is "
-                + "watched for until you press Start ride.",
-                color = WARN, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
-        }
-        // Android makes the listener post a notice; one tap switches it off for good,
-        // and the listening carries on (Jack, 2026-09-28). Asked again on every return.
-        val notice = remember(resumeCount) { ObserverService.running && ObserverService.noticeShown(ctx) }
-        if (notice) {
-            TextButton({
-                runCatching {
-                    startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
-                        .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
-                        .putExtra(Settings.EXTRA_CHANNEL_ID, ObserverService.CHANNEL))
-                }
-            }, Modifier.padding(bottom = 4.dp)) {
-                Text("Hide the \"Listening for rides\" notification — switch it off on the next screen",
-                    color = DIM, fontSize = 12.sp)
-            }
+        if (logFailed) {
+            Text("Log upload failed. Tap settings to try again.",
+                color = WARN, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
         }
         BigButton("Start trip", GO, enabled = !busy) {
-            act({ Trip.startTrip(ctx) }, "trip open — press Start ride when you set off")
+            act({ Trip.startTrip(ctx) }, "")
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(28.dp))
+    }
+
+    /**
+     * The rider or the parked bike: between the figures above and the buttons below,
+     * centred in whatever is left, and never taller than [SCENE_MAX] — too small to
+     * see on one build, a whole screen on the next (Jack, 2026-10-12).
+     */
+    @Composable
+    private fun ColumnScope.SceneBox(scene: @Composable (Modifier) -> Unit) {
+        Box(Modifier.weight(1f).fillMaxWidth().padding(top = 10.dp, bottom = 10.dp), contentAlignment = Alignment.BottomCenter) {
+            scene(Modifier.fillMaxWidth().heightIn(max = SCENE_MAX).fillMaxHeight())
+        }
     }
 
     @Composable
@@ -451,38 +525,42 @@ class MainActivity : ComponentActivity() {
         act: (() -> Boolean, String) -> Unit, status: String,
     ) {
         val ctx = this@MainActivity
-        Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Pill("RIDING", GO)
-            Spacer(Modifier.height(18.dp))
-            Text("SPEED", color = DIM, fontSize = 13.sp, letterSpacing = 2.sp)
+            Spacer(Modifier.width(16.dp))
+            Text("Speed ", color = DIM, fontSize = 16.sp)
             Text(
                 ((me?.speed ?: 0.0).takeIf { !it.isNaN() } ?: 0.0).toInt().toString(),
-                color = INK, fontSize = 76.sp, fontWeight = FontWeight.Bold
+                color = INK, fontSize = 20.sp, fontWeight = FontWeight.Bold
             )
-            Text("KM/H", color = DIM, fontSize = 14.sp, letterSpacing = 2.sp)
-            Spacer(Modifier.height(20.dp))
-            Card {
-                KeyValue("Ride time", elapsed(Trip.startedAt(ctx), tick))
-                KeyValue("Last packet",
-                    me?.lastSeenS?.takeIf { !it.isNaN() }?.let { "${it.toInt()} s ago" } ?: "—",
-                    if ((me?.lastSeenS ?: 0.0) > 20) WARN else INK)
-                me?.battery?.let { KeyValue("Battery", "$it%") }
-            }
+            Text(" km/h", color = DIM, fontSize = 16.sp)
+        }
+        Spacer(Modifier.height(14.dp))
+        Card {
+            KeyValue("Ride time", elapsed(Trip.startedAt(ctx), tick))
+            KeyValue("Last packet",
+                me?.lastSeenS?.takeIf { !it.isNaN() }?.let { "${it.toInt()} s ago" } ?: "—",
+                if ((me?.lastSeenS ?: 0.0) > 20) WARN else INK)
+            KeyValue("G-force", Live.g.takeIf { !it.isNaN() }
+                ?.let { String.format(java.util.Locale.US, "%.2f g", it) } ?: "—")
+            KeyValue("Rotation", Live.rot.takeIf { !it.isNaN() }
+                ?.let { String.format(java.util.Locale.US, "%.1f r/s", it) } ?: "—")
+            KeyValue("Peak G", String.format(java.util.Locale.US, "%.2f g", Live.peakG))
+            KeyValue("Peak rotation", String.format(java.util.Locale.US, "%.1f r/s", Live.peakRot))
         }
         // The road runs at the speed actually being ridden.
-        StateScene(riding = true, speedKmh = me?.speed?.takeIf { !it.isNaN() } ?: 0.0,
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = 10.dp))
+        SceneBox { m -> StateScene(riding = true, speedKmh = me?.speed?.takeIf { !it.isNaN() } ?: 0.0, modifier = m) }
         if (status.isNotEmpty()) {
             Text(status, color = DIM, fontSize = 13.sp, modifier = Modifier.padding(bottom = 8.dp))
         }
         BigButton("Pause ride", WARN, enabled = !busy, text = Color(0xFF1A1206)) {
-            act({ Trip.pauseRide(ctx) }, "off the bike — still sharing location")
+            act({ Trip.pauseRide(ctx) }, "")
         }
         Spacer(Modifier.height(10.dp))
         QuietButton("End trip", enabled = !busy) {
-            act({ Trip.endTrip(ctx) }, "trip ended")
+            act({ Trip.endTrip(ctx) }, "")
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(28.dp))
     }
 
     @Composable
@@ -493,45 +571,30 @@ class MainActivity : ComponentActivity() {
         // The same screen serves the start of a trip and a stop in the middle of
         // one; only the words change (Jack, 2026-09-20).
         val ridden = Trip.hasRidden(ctx)
-        Column(Modifier.fillMaxWidth()) {
-            Pill(if (ridden) "OFF THE BIKE" else "NOT RIDING YET", Color(0xFF4DA3FF))
-            Spacer(Modifier.height(18.dp))
-            Text("TRIP CONTINUES · SINCE", color = DIM, fontSize = 12.sp, letterSpacing = 1.5.sp)
-            Text(clockTime(Trip.startedAt(ctx)), color = INK, fontSize = 40.sp,
-                fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
-            Spacer(Modifier.height(18.dp))
-            Card {
-                KeyValue("Location", "sharing", GO)
-                KeyValue("Sensors", "off", DIM)
-                KeyValue("Crash detection", "off", DIM)
-                KeyValue(if (ridden) "Off the bike for" else "Trip open for",
-                    elapsed(Trip.offBikeSince(ctx), tick))
-                if (!Trip.autoResume(ctx)) KeyValue("Auto-resume", "off", WARN)
-            }
-            Spacer(Modifier.height(10.dp))
-            Text(
-                if (!Trip.autoResume(ctx))
-                    "Auto-resume is off: this stays off the bike however fast it moves, and "
-                        + "nothing is watched for. Press Start ride to change that."
-                else "Ride away and it ${if (ridden) "resumes" else "starts"} by itself — " +
-                    "${Trip.RESUME_KMH.toInt()} km/h for ${Trip.RESUME_S} seconds is riding, " +
-                    "whatever the app was told.",
-                color = if (Trip.autoResume(ctx)) FAINT else WARN, fontSize = 12.sp
-            )
+        Pill("OFF BIKE", Color(0xFF4DA3FF))
+        Spacer(Modifier.height(14.dp))
+        Card {
+            KeyValue("Trip continues since", clockTime(Trip.startedAt(ctx)))
+            KeyValue("Location", "Sharing", GO)
+            KeyValue("Sensors", "Off", DIM)
+            KeyValue("Crash detection", "Off", DIM)
+            KeyValue(if (ridden) "Off bike for" else "Trip open for",
+                elapsed(Trip.offBikeSince(ctx), tick))
+            if (Trip.autoResume(ctx)) KeyValue("Auto-resume", "On", GO)
+            else KeyValue("Auto-resume", "Off", BAD)
         }
-        StateScene(riding = false, speedKmh = 0.0,
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = 10.dp))
+        SceneBox { m -> StateScene(riding = false, speedKmh = 0.0, modifier = m) }
         if (status.isNotEmpty()) {
             Text(status, color = DIM, fontSize = 13.sp, modifier = Modifier.padding(bottom = 8.dp))
         }
         BigButton(if (ridden) "Resume ride" else "Start ride", GO, enabled = !busy) {
-            act({ Trip.resumeRide(ctx) }, "riding")
+            act({ Trip.resumeRide(ctx) }, "")
         }
         Spacer(Modifier.height(10.dp))
         QuietButton("End trip", enabled = !busy) {
-            act({ Trip.endTrip(ctx) }, "trip ended")
+            act({ Trip.endTrip(ctx) }, "")
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(28.dp))
     }
 
     /** The rider's own open incident: what was seen, and the three ways out of it. */
@@ -658,7 +721,7 @@ class MainActivity : ComponentActivity() {
             RiderMap(
                 lat = other.lat, lon = other.lon,
                 speedKmh = other.speed.takeIf { !it.isNaN() } ?: 0.0,
-                stoppedLabel = if (other.state == "offbike") "off the bike" else "stopped",
+                stoppedLabel = if (other.state == "offbike") "Off bike" else "Stopped",
                 alarm = theirs != null && theirs.state == "sos",
                 height = height,
                 signalLostFor = lostFor,
@@ -712,7 +775,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun StatePill(state: String) = when (state) {
         "riding" -> Pill("RIDING", GO)
-        "offbike" -> Pill("OFF THE BIKE", Color(0xFF4DA3FF))
+        "offbike" -> Pill("OFF BIKE", Color(0xFF4DA3FF))
         else -> Pill("ASLEEP", FAINT)
     }
 
@@ -731,7 +794,7 @@ class MainActivity : ComponentActivity() {
         // Mine.
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             if (tripState == Trip.State.RIDING) Pill("RIDING", GO)
-            else Pill("OFF THE BIKE", Color(0xFF4DA3FF))
+            else Pill("OFF BIKE", Color(0xFF4DA3FF))
             Spacer(Modifier.weight(1f))
             Text(elapsed(Trip.startedAt(ctx), tick), color = DIM, fontSize = 14.sp,
                 fontFamily = FontFamily.Monospace)
@@ -744,9 +807,9 @@ class MainActivity : ComponentActivity() {
             Text(" KM/H", color = DIM, fontSize = 14.sp, modifier = Modifier.padding(bottom = 14.dp))
             Spacer(Modifier.weight(1f))
             Column(horizontalAlignment = Alignment.End, modifier = Modifier.padding(bottom = 12.dp)) {
-                Text(me?.lastSeenS?.takeIf { !it.isNaN() }?.let { "sent ${it.toInt()} s ago" } ?: "not sent yet",
+                Text(me?.lastSeenS?.takeIf { !it.isNaN() }?.let { "Sent ${it.toInt()} s ago" } ?: "Not sent yet",
                     color = if ((me?.lastSeenS ?: 0.0) > 20) WARN else FAINT, fontSize = 12.sp)
-                me?.battery?.let { Text("battery $it%", color = FAINT, fontSize = 12.sp) }
+                me?.battery?.let { Text("Battery $it%", color = FAINT, fontSize = 12.sp) }
             }
         }
         Spacer(Modifier.height(4.dp))
@@ -764,7 +827,7 @@ class MainActivity : ComponentActivity() {
             Text(" KM/H", color = DIM, fontSize = 12.sp)
         }
         Text(
-            other.lastSeenS.takeIf { !it.isNaN() }?.let { "last packet ${it.toInt()} s ago" } ?: "no packet yet",
+            other.lastSeenS.takeIf { !it.isNaN() }?.let { "Last packet ${it.toInt()} s ago" } ?: "No packet yet",
             color = if (other.lastSeenS > 20) WARN else FAINT, fontSize = 12.sp
         )
         Spacer(Modifier.height(8.dp))
@@ -815,9 +878,9 @@ class MainActivity : ComponentActivity() {
             ) {
                 Text(
                     when (tripState) {
-                        Trip.State.IDLE -> "Your trip · not started"
-                        Trip.State.OFF_BIKE -> "You · off the bike"
-                        Trip.State.RIDING -> "You · riding"
+                        Trip.State.IDLE -> "Your trip · Not started"
+                        Trip.State.OFF_BIKE -> "You · Off bike"
+                        Trip.State.RIDING -> "You · Riding"
                     },
                     color = INK, fontSize = 14.sp
                 )
@@ -834,26 +897,22 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
                     when (tripState) {
                         Trip.State.IDLE -> {
-                            if (!Trip.autoResume(ctx)) {
-                                Text("Auto-resume is off — the ride will not start by itself.",
-                                    color = WARN, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
-                            }
                             BigButton("Start trip", GO, enabled = !busy) {
-                                then({ Trip.startTrip(ctx) }, "trip open — press Start ride when you set off")
+                                then({ Trip.startTrip(ctx) }, "")
                             }
                         }
                         Trip.State.OFF_BIKE -> {
                             BigButton(if (Trip.hasRidden(ctx)) "Resume ride" else "Start ride", GO,
-                                enabled = !busy) { then({ Trip.resumeRide(ctx) }, "riding") }
+                                enabled = !busy) { then({ Trip.resumeRide(ctx) }, "") }
                             Spacer(Modifier.height(10.dp))
-                            QuietButton("End trip", enabled = !busy) { then({ Trip.endTrip(ctx) }, "trip ended") }
+                            QuietButton("End trip", enabled = !busy) { then({ Trip.endTrip(ctx) }, "") }
                         }
                         Trip.State.RIDING -> {
                             BigButton("Pause ride", WARN, enabled = !busy, text = Color(0xFF1A1206)) {
-                                then({ Trip.pauseRide(ctx) }, "off the bike — still sharing location")
+                                then({ Trip.pauseRide(ctx) }, "")
                             }
                             Spacer(Modifier.height(10.dp))
-                            QuietButton("End trip", enabled = !busy) { then({ Trip.endTrip(ctx) }, "trip ended") }
+                            QuietButton("End trip", enabled = !busy) { then({ Trip.endTrip(ctx) }, "") }
                         }
                     }
                 }
@@ -869,7 +928,7 @@ class MainActivity : ComponentActivity() {
     @androidx.annotation.VisibleForTesting
     internal fun showForTest(me: Relay.Rider?, other: Relay.Rider, tripState: Trip.State, drawerOpen: Boolean) {
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = PANEL)) {
+            Themed {
                 Surface(Modifier.fillMaxSize(), color = BG) {
                     Column(Modifier.fillMaxSize().padding(horizontal = 18.dp)) {
                         Header(120L, null)
@@ -881,7 +940,7 @@ class MainActivity : ComponentActivity() {
                                     System.currentTimeMillis())
                             }
                         }
-                        Footer(false) {}
+                        Footer(false, null) {}
                     }
                 }
             }
@@ -982,7 +1041,7 @@ class MainActivity : ComponentActivity() {
                 onValueChange = { v ->
                     code = v.uppercase().filter { it.isLetterOrDigit() || it == '-' }.take(11)
                 },
-                label = { Text("pairing code") },
+                label = { Text("Pairing code") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(
                     capitalization = KeyboardCapitalization.Characters,
@@ -994,7 +1053,7 @@ class MainActivity : ComponentActivity() {
             BigButton("Pair this phone", GO,
                 enabled = !busy && code.count { it.isLetterOrDigit() } == 8) {
                 busy = true
-                result = "pairing…"
+                result = "Pairing…"
                 scope.launch {
                     result = withContext(Dispatchers.IO) { Uploader.pair(ctx, code) }
                     busy = false
@@ -1009,87 +1068,304 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun Footer(open: Boolean, toggle: () -> Unit) {
+    private fun Footer(open: Boolean, onHelp: (() -> Unit)?, toggle: () -> Unit) {
         Row(
-            Modifier.fillMaxWidth().padding(vertical = 12.dp),
+            Modifier.fillMaxWidth().padding(vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("moto tracker", color = FAINT, fontSize = 11.sp)
-            Spacer(Modifier.weight(1f))
-            TextButton(toggle, contentPadding = PaddingValues(4.dp)) {
-                Text(if (open) "hide diagnostics" else "diagnostics",
-                    color = FAINT, fontSize = 11.sp)
+            Text("Tether ${BuildConfig.VERSION_NAME}", color = FAINT, fontSize = 11.sp, modifier = Modifier.weight(1f))
+            if (onHelp != null) AlarmButton(onHelp)
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                IconButton(toggle, Modifier.size(52.dp)) {
+                    Gear(if (open) INK else DIM, Modifier.size(30.dp))
+                }
             }
         }
     }
 
-    /** Everything that is useful to a builder and to nobody else. */
+    /**
+     * I need help: a round red alarm siren between the name and the gear. It only asks;
+     * [HelpDialog] sends, so a pocket cannot raise a false alarm.
+     */
     @Composable
-    private fun Diagnostics(paired: Boolean, onChanged: () -> Unit) {
+    private fun AlarmButton(onClick: () -> Unit) {
+        Box(
+            Modifier.size(52.dp).clip(CircleShape).background(BAD).clickable(onClick = onClick)
+                .semantics { contentDescription = "I need help" },
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(Modifier.size(30.dp)) {
+                val w = size.width
+                val white = Color.White
+                // The dome, its base, and three rays off the top.
+                drawArc(white, 180f, 180f, useCenter = true,
+                    topLeft = Offset(w * 0.2f, w * 0.34f), size = Size(w * 0.6f, w * 0.6f))
+                drawRect(white, Offset(w * 0.12f, w * 0.64f), Size(w * 0.76f, w * 0.14f))
+                for (a in listOf(-50f, 0f, 50f)) rotateDraw(a, Offset(w / 2, w * 0.64f)) {
+                    drawLine(white, Offset(w / 2, w * 0.2f), Offset(w / 2, w * 0.04f),
+                        strokeWidth = w * 0.09f, cap = StrokeCap.Round)
+                }
+            }
+        }
+    }
+
+    /** A gear, drawn rather than imported: the icon library is a lot of app for one glyph. */
+    @Composable
+    private fun Gear(colour: Color, modifier: Modifier) {
+        Canvas(modifier) {
+            val c = Offset(size.width / 2, size.height / 2)
+            val r = size.minDimension / 2
+            val w = r * 0.22f
+            drawCircle(colour, radius = r * 0.62f, center = c, style = Stroke(width = r * 0.24f))
+            drawCircle(colour, radius = r * 0.2f, center = c, style = Stroke(width = r * 0.12f))
+            for (i in 0 until 8) rotateDraw(i * 45f, c) {
+                drawLine(colour, Offset(c.x, c.y - r * 0.62f), Offset(c.x, c.y - r * 0.95f),
+                    strokeWidth = w * 1.5f, cap = StrokeCap.Butt)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- I need help
+
+    /** Two steps, so a pocket cannot send a false alarm to the other rider. */
+    @Composable
+    private fun HelpDialog(who: String, onCancel: () -> Unit, onSend: () -> Unit) {
+        AlertDialog(
+            onDismissRequest = onCancel,
+            title = { Text("Alert $who of an emergency?") },
+            confirmButton = {
+                Button(onSend, colors = ButtonDefaults.buttonColors(
+                    containerColor = BAD, contentColor = Color.White)) {
+                    Text("I Need Help", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                Button(onCancel, colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF5A606A), contentColor = Color.White)) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // ---------------------------------------------------------------- settings
+
+    /** One row of Settings: a title, what it is doing now, and optionally a switch. */
+    @Composable
+    private fun SettingRow(
+        title: String, detail: String, titleColour: Color = INK,
+        trailing: (@Composable () -> Unit)? = null, onClick: () -> Unit,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PANEL2)
+                .clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(title, color = titleColour, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                if (detail.isNotEmpty()) Text(detail, color = DIM, fontSize = 12.sp)
+            }
+            trailing?.let { Spacer(Modifier.width(10.dp)); it() }
+        }
+        Spacer(Modifier.height(8.dp))
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    private suspend fun here(): android.location.Location? = suspendCancellableCoroutine { cont ->
+        val token = CancellationTokenSource()
+        cont.invokeOnCancellation { token.cancel() }
+        runCatching {
+            LocationServices.getFusedLocationProviderClient(this)
+                .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, token.token)
+                .addOnSuccessListener { cont.resume(it) }
+                .addOnFailureListener { cont.resume(null) }
+        }.onFailure { cont.resume(null) }
+    }
+
+    private fun setHome(lat: Double, lon: Double) {
+        Home.set(this, lat, lon)
+        askForBackgroundLocation()
+    }
+
+    private fun homeNote() =
+        if (hasBackgroundLocation()) "Home set."
+        else "Home set. Allow location \"all the time\" so the phone can notice you " +
+            "leaving with the app closed."
+
+    /**
+     * Choose home on a map: it opens on this phone's position with 100 km each way in
+     * view; a long press drops a pin, and only then does the button appear.
+     */
+    @Composable
+    private fun HomePicker() {
+        val ctx = this
+        var start by remember { mutableStateOf<Pair<Double, Double>?>(null) }
+        var pin by remember { mutableStateOf<Pair<Double, Double>?>(null) }
+        LaunchedEffect(Unit) {
+            val at = here()
+            start = when {
+                at != null -> at.latitude to at.longitude
+                Home.isSet(ctx) -> Home.lat(ctx) to Home.lon(ctx)
+                else -> HOME_LAT to HOME_LON
+            }
+        }
+        Column(Modifier.fillMaxSize()) {
+            Row(Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 10.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("Set location on map", color = INK, fontSize = 22.sp,
+                    fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                TextButton({ pickingHome = false }) { Text("Cancel", color = DIM, fontSize = 15.sp) }
+            }
+            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                val at = start
+                if (at == null) {
+                    Text("Finding where you are…", color = FAINT, fontSize = 14.sp,
+                        modifier = Modifier.align(Alignment.Center))
+                } else {
+                    key(maxHeight) { HomePickerMap(at.first, at.second, maxHeight) { la, lo -> pin = la to lo } }
+                }
+            }
+            // The button's room is kept whether or not it is showing: the map is built
+            // for the height it starts with, and must not be resized when a pin lands.
+            Box(Modifier.fillMaxWidth().height(72.dp).padding(top = 10.dp)) {
+                pin?.let { (la, lo) ->
+                    BigButton("Set home location", GO) {
+                        setHome(la, lo)
+                        android.widget.Toast.makeText(ctx, homeNote(),
+                            android.widget.Toast.LENGTH_LONG).show()
+                        pickingHome = false
+                    }
+                }
+            }
+            Text("Pinch to zoom, drag to move the map. Press and hold where home is to drop a " +
+                "pin; hold somewhere else to move it.",
+                color = DIM, fontSize = 12.sp, modifier = Modifier.padding(vertical = 10.dp))
+        }
+    }
+
+    @Composable
+    private fun SettingsScreen(
+        paired: Boolean, tripState: Trip.State, onPaired: () -> Unit, onLogSent: () -> Unit,
+    ) {
         val ctx = this
         val scope = rememberCoroutineScope()
         var line by remember { mutableStateOf("") }
         var confirmUnpair by remember { mutableStateOf(false) }
-        var confirmRaise by remember { mutableStateOf<String?>(null) }
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PANEL2)
-                .padding(14.dp).verticalScroll(rememberScrollState())
-        ) {
-            Text("build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
-                color = DIM, fontSize = 12.sp)
-            Text("rider ${Identity.get(ctx)} · ${DeviceKey.describe(ctx)}",
-                color = DIM, fontSize = 12.sp)
-            Text("battery exemption: ${if (Power.exempt(ctx)) "granted" else "DENIED"}",
-                color = if (Power.exempt(ctx)) DIM else WARN, fontSize = 12.sp)
-            Spacer(Modifier.height(8.dp))
-            // For a trip that is not on the bike at all (Jack, 2026-09-20).
-            var auto by remember { mutableStateOf(Trip.autoResume(ctx)) }
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f).padding(end = 10.dp)) {
-                    Text("Disable auto-resume", color = if (auto) INK else WARN, fontSize = 13.sp)
-                    Text("For a trip on foot, on a bicycle or in a car: the ride never starts "
-                        + "by itself, so no sensors and no crash detection.",
-                        color = FAINT, fontSize = 11.sp)
-                }
-                Switch(checked = !auto, onCheckedChange = { off ->
-                    auto = !off
-                    Trip.setAutoResume(ctx, auto)
-                })
+        var homeDialog by remember { mutableStateOf(false) }
+        var homeSet by remember { mutableStateOf(Home.isSet(ctx)) }
+        var auto by remember { mutableStateOf(Trip.autoResume(ctx)) }
+        val exempt = remember(resumeCount) { Power.exempt(ctx) }
+
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+            Text("Settings", color = INK, fontSize = 26.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
+
+            // 1. Where home is: arriving ends the trip, leaving opens one.
+            SettingRow(
+                "Set home location",
+                if (homeSet) String.format(java.util.Locale.US, "Home is %.4f, %.4f — tap to change",
+                    Home.lat(ctx), Home.lon(ctx))
+                else "Not set. Stand at home and tap.",
+            ) { homeDialog = true }
+
+            // 2. For a trip that is not on the bike at all (Jack, 2026-09-20).
+            SettingRow(
+                "Disable auto-resume",
+                "Trips never open or resume by themselves. Arriving home still ends one.",
+                titleColour = if (auto) INK else WARN,
+                trailing = {
+                    Switch(checked = !auto, onCheckedChange = { off ->
+                        auto = !off
+                        Trip.setAutoResume(ctx, auto)
+                    })
+                },
+            ) {
+                auto = !auto
+                Trip.setAutoResume(ctx, auto)
             }
-            Spacer(Modifier.height(8.dp))
-            TextButton({
+
+            // 3. Normally automatic; this is for when it was not.
+            SettingRow("Upload log", "Sent by itself when a trip ends. Tap to send it now.") {
                 scope.launch {
-                    line = withContext(Dispatchers.IO) { Uploader.postLog(ctx) }
+                    line = "Uploading…"
+                    line = withContext(Dispatchers.IO) { Uploader.forceLog(ctx) }
+                    onLogSent()
                 }
-            }) { Text("Upload log", color = INK, fontSize = 13.sp) }
-            // The map only appears while watching the other rider, so this is the one
-            // way to ask whether it would work without waiting for a ride (2026-09-20).
-            TextButton({
-                scope.launch {
-                    line = "checking the map…"
-                    line = withContext(Dispatchers.IO) {
-                        val k = Relay.mapKey(ctx)
-                        if (k == null) "no map key — the relay refused it or could not be reached"
-                        else "map key ok · tile: " + Uploader.probeTile(k)
-                    }
-                }
-            }) { Text("Check the map", color = INK, fontSize = 13.sp) }
-            TextButton({ confirmRaise = "crash" }) {
-                Text("Simulate crash (real incident)", color = WARN, fontSize = 13.sp)
             }
-            TextButton({ confirmRaise = "help" }) { Text("I need help", color = BAD, fontSize = 13.sp) }
-            TextButton({
+
+            // 4.
+            SettingRow(
+                "Set battery exemption",
+                if (exempt) "Granted" else "Not granted — tap to allow",
+                titleColour = if (exempt) INK else WARN,
+            ) {
                 runCatching {
                     startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                         Uri.parse("package:$packageName")))
                 }
-            }) { Text("Battery exemption", color = INK, fontSize = 13.sp) }
+            }
+
+            // 5.
             if (paired) {
-                TextButton({ confirmUnpair = true }) {
-                    Text("Unpair this phone", color = DIM, fontSize = 13.sp)
+                SettingRow("Unpair this phone", "Deletes this phone's key.") { confirmUnpair = true }
+            } else {
+                SettingRow("Pair this phone", "Needs a code from the Mac.") {
+                    showSettings = false
+                    onPaired()
                 }
             }
-            if (line.isNotEmpty()) Text(line, color = DIM, fontSize = 12.sp)
+
+            if (line.isNotEmpty()) Text(line, color = DIM, fontSize = 13.sp,
+                modifier = Modifier.padding(vertical = 4.dp))
+            Spacer(Modifier.height(10.dp))
+            Text("Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · " +
+                "${Identity.get(ctx)} · ${DeviceKey.describe(ctx)}", color = FAINT, fontSize = 11.sp)
+            Spacer(Modifier.height(10.dp))
+        }
+
+        if (homeDialog) {
+            AlertDialog(
+                onDismissRequest = { homeDialog = false },
+                title = { Text("Set home location") },
+                text = {
+                    Column {
+                        Text("Arriving home ends a trip by itself. Leaving opens one, unless " +
+                            "auto-resume is disabled.")
+                        Spacer(Modifier.height(14.dp))
+                        Button({
+                            homeDialog = false
+                            scope.launch {
+                                line = "Finding where you are…"
+                                val at = here()
+                                line = when {
+                                    at == null -> "No GPS fix yet — try again outdoors."
+                                    at.accuracy > 50f ->
+                                        "GPS is only good to ${at.accuracy.toInt()} m — wait a moment and try again."
+                                    else -> {
+                                        setHome(at.latitude, at.longitude)
+                                        homeSet = true
+                                        homeNote()
+                                    }
+                                }
+                            }
+                        }, Modifier.fillMaxWidth()) { Text("Use my current location") }
+                        Spacer(Modifier.height(8.dp))
+                        Button({ homeDialog = false; pickingHome = true },
+                            Modifier.fillMaxWidth()) { Text("Set location on map") }
+                        if (homeSet) {
+                            Spacer(Modifier.height(8.dp))
+                            TextButton({
+                                Home.clear(ctx)
+                                homeSet = false
+                                homeDialog = false
+                                line = "Home cleared."
+                            }, Modifier.fillMaxWidth()) { Text("Clear home", color = BAD) }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton({ homeDialog = false }) { Text("Cancel") } }
+            )
         }
         if (confirmUnpair) {
             AlertDialog(
@@ -1098,41 +1374,12 @@ class MainActivity : ComponentActivity() {
                 text = { Text("The key is deleted. Pairing again needs a new code.") },
                 confirmButton = {
                     TextButton({
-                        DeviceKey.clear(this)
+                        DeviceKey.clear(ctx)
                         confirmUnpair = false
-                        onChanged()
+                        onPaired()
                     }) { Text("Unpair") }
                 },
                 dismissButton = { TextButton({ confirmUnpair = false }) { Text("Cancel") } }
-            )
-        }
-        // Both of these alarm every Observer, so neither goes on one tap. A pocket
-        // pressing the same spot again lands on the dialog's scrim, which only
-        // dismisses it.
-        confirmRaise?.let { what ->
-            val help = what == "help"
-            AlertDialog(
-                onDismissRequest = { confirmRaise = null },
-                title = { Text(if (help) "Send “I need help”?" else "Simulate a crash?") },
-                text = {
-                    Text(if (help) "This opens a real incident straight away. Both Macs and the other phone alarm."
-                         else "This raises a real incident. In ${Config.CONFIRM_WINDOW_S} seconds both Macs " +
-                              "and the other phone alarm.")
-                },
-                confirmButton = {
-                    TextButton({
-                        confirmRaise = null
-                        scope.launch {
-                            line = if (help) {
-                                val ok = withContext(Dispatchers.IO) { Relay.needHelp(ctx) }
-                                if (ok) "I need help sent" else "the relay refused that"
-                            } else {
-                                withContext(Dispatchers.IO) { Relay.simulateCrash(ctx) }
-                            }
-                        }
-                    }) { Text(if (help) "Send it" else "Simulate", color = BAD) }
-                },
-                dismissButton = { TextButton({ confirmRaise = null }) { Text("Cancel") } }
             )
         }
     }

@@ -329,7 +329,17 @@ object Uploader {
 
     private const val PENDING_LOG = "pending_log"
 
-    /** The whole log file, on demand from diagnostics. */
+    /**
+     * Upload log, from Settings. A log that failed to go when the trip ended is sent
+     * the proper way, which clears it and the warning on the home screen; otherwise
+     * the whole file goes as it stands.
+     */
+    fun forceLog(ctx: Context): String =
+        if (logWaiting(ctx)) {
+            if (uploadRideLog(ctx)) "log uploaded" else "log upload failed — no signal for the relay"
+        } else postLog(ctx)
+
+    /** The whole log file, as it stands. */
     fun postLog(ctx: Context): String = runCatching {
         val body = RideLog.read(ctx)
         if (body.isEmpty()) return "log is empty"

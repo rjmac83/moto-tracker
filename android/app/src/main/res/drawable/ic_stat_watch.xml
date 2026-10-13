@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- An eye: this phone is watching the other rider's ride. -->
+<!-- The Tether glyph, in one colour as the status bar needs: two riders and the line
+     between them. Used wherever this phone is listening or watching. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp" android:height="24dp"
     android:viewportWidth="24" android:viewportHeight="24">
+    <path android:strokeColor="#FFFFFF" android:strokeWidth="2.2"
+        android:strokeLineCap="round" android:fillColor="#00000000"
+        android:pathData="M6.5,17.5 C6.5,11 17.5,13 17.5,6.5"/>
     <path android:fillColor="#FFFFFF"
-        android:pathData="M12,5C7,5 2.7,8.1 1,12.5C2.7,16.9 7,20 12,20s9.3,-3.1 11,-7.5C21.3,8.1 17,5 12,5zM12,17.5c-2.8,0 -5,-2.2 -5,-5s2.2,-5 5,-5s5,2.2 5,5S14.8,17.5 12,17.5zM12,9.5c-1.7,0 -3,1.3 -3,3s1.3,3 3,3s3,-1.3 3,-3S13.7,9.5 12,9.5z"/>
+        android:pathData="M6.5,14.5 a3.4,3.4 0 1,0 0.01,0 zM17.5,3.1 a3.4,3.4 0 1,0 0.01,0 z"/>
 </vector>

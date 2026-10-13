@@ -123,6 +123,8 @@ object Trip {
      * crash detection wait for Start ride — or for the bike to simply pull away.
      */
     fun startTrip(ctx: Context): Boolean {
+        Home.tripOpened()
+        Live.reset()
         set(ctx, State.OFF_BIKE)
         TrackerService.start(ctx)
         return Uploader.tripStart(ctx, riding = false)
@@ -204,7 +206,21 @@ object Trip {
      * in seconds rather than minutes and crash detection is not left off.
      */
     fun tickMs(ctx: Context): Long =
-        if (state(ctx) == State.OFF_BIKE && !moving) Config.OFF_BIKE_TICK_MS else Config.TICK_MS
+        if (state(ctx) == State.OFF_BIKE && !moving && System.currentTimeMillis() >= boostUntilMs)
+            Config.OFF_BIKE_TICK_MS
+        else Config.TICK_MS
+
+    @Volatile
+    private var boostUntilMs = 0L
+
+    /**
+     * The full rate for a while whatever the state says. A trip opened by leaving home
+     * does not yet know whether the phone is on a bike, and the first slow fix would
+     * cost half a minute before the pull-away rules saw any speed.
+     */
+    fun boostCadence(forMs: Long) {
+        boostUntilMs = System.currentTimeMillis() + forMs
+    }
 
     /** Sensors and crash detection run while riding, and only then. */
     fun sensorsWanted(ctx: Context) = state(ctx) == State.RIDING

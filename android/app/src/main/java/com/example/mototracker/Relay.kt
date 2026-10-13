@@ -262,27 +262,6 @@ object Relay {
         java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", java.util.Locale.US)
             .format(java.util.Date(ms))
 
-    /**
-     * DEV ONLY: raises a real crash candidate through the relay, exactly
-     * as the detector will when it exists. Everything downstream is then real — the
-     * confirm window, the escalation, the Mini's alarm, the Observer phone — which is
-     * the whole point: a rehearsal that proves the chain, not a mock of it.
-     */
-    fun simulateCrash(ctx: Context, windowS: Int = Config.CONFIRM_WINDOW_S): String {
-        val evidence = JSONObject()
-            .put("peak_g", 9.4).put("peak_rot", 6.1)
-            .put("simulated", true)
-        val body = JSONObject()
-            .put("rider", Identity.get(ctx))
-            .put("confirm_window_s", windowS)
-            .put("evidence", evidence)
-        val answer = Uploader.postJson(ctx, "/incident/candidate", body)
-            ?: return "✗ the relay did not accept it"
-        val id = answer.optInt("incident_id")
-        RideLog.write(ctx, "SIMCRASH", "simulated candidate #$id raised, ${windowS}s to retract")
-        return "candidate #$id raised — ${windowS}s to press I'm OK"
-    }
-
     /** Within the confirm window: nothing happened, drop it before anyone is told. */
     fun retract(ctx: Context, id: Int): Boolean {
         val ok = Uploader.postJson(ctx, "/incident/retract",

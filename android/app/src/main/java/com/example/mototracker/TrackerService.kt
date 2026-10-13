@@ -83,6 +83,7 @@ class TrackerService : Service() {
             // Off the bike, location keeps reporting and the sensors do not: the
             // trip continues, but nothing is being detected (Jack, 2026-09-16).
             val s = if (riding) sensors.drain() else null.also { sensors.drain() }
+            if (s != null) Live.offer(s)
             val line = if (s != null) String.format(
                 Locale.US,
                 "lat=%.6f lon=%.6f acc=%.1f speed=%.1f batt=%d age=%.1f tick=%d " +
@@ -108,6 +109,16 @@ class TrackerService : Service() {
                     atMs = System.currentTimeMillis(),
                     speedKmh = speedKmh,
                     peakG = s.peakG, meanG = s.meanG, peakRot = s.peakRot, accelN = s.n))
+
+            // Arriving home ends the trip, whether or not auto-resume is on.
+            if (Home.arrived(this@TrackerService, loc.latitude, loc.longitude,
+                    loc.accuracy, speedKmh)) {
+                RideLog.write(this@TrackerService, "HOME", "arrived home — ending the trip")
+                // Not on io: ending the trip stops this service, which cancels io.
+                val ctx = applicationContext
+                Thread { Trip.endTrip(ctx) }.start()
+                return
+            }
 
             // A rider who pulls away without pressing anything is riding.
             if (Trip.noticeMovement(this@TrackerService, speedKmh)) {
@@ -234,7 +245,7 @@ class TrackerService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
         return Notification.Builder(this, CHANNEL)
-            .setContentTitle("Moto Tracker")
+            .setContentTitle("Tether")
             .setContentText("Sharing your position")
             .setSmallIcon(R.drawable.ic_stat_ride)
             .setContentIntent(open)
